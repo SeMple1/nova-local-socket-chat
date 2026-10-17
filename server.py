@@ -5,24 +5,24 @@ import sys
 import threading
 from datetime import datetime
 
-HOST, PORT = "0.0.0.0", int(sys.argv[1]) if len(sys.argv) > 1 else 5050
-users, history = {}, []
-lock = threading.RLock()
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
+users, history, lock = {}, [], threading.RLock()
+MAX_LINE = 12000
 
 
 def pack(kind, **data):
-    return (json.dumps({"type": kind, **data}, ensure_ascii=False) + "\n").encode("utf-8")
+    return (json.dumps({"type": kind, **data}, ensure_ascii=False) + "\n").encode()
 
 
 def broadcast(kind, **data):
-    message = pack(kind, **data)
+    msg = pack(kind, **data)
     with lock:
         if kind == "chat":
-            history.append(json.loads(message))
+            history.append(json.loads(msg))
             del history[:-60]
         for client in list(users):
             try:
-                client.sendall(message)
+                client.sendall(msg)
             except OSError:
                 pass
 
@@ -33,25 +33,24 @@ def refresh():
     broadcast("users", names=names)
 
 
-def handle(client, address):
+def handle(client):
     name = None
     try:
         with client, client.makefile("r", encoding="utf-8") as stream:
-            hello = json.loads(stream.readline())
+            hello = json.loads(stream.readline(MAX_LINE + 1))
             if hello.get("type") != "join":
                 return
             base = str(hello.get("name") or "Guest").strip()[:24] or "Guest"
             with lock:
-                name = base
-                n = 2
+                name, n = base, 2
                 while name in users.values():
                     name, n = f"{base} ({n})", n + 1
                 users[client] = name
-                client.sendall(pack("welcome", name=name, history=history[-60:]))
+                client.sendall(pack("welcome", name=name, history=history))
             broadcast("system", text=f"{name} joined the room")
             refresh()
-            for line in stream:
-                if len(line) > 12000:
+            for line in iter(lambda: stream.readline(MAX_LINE + 1), ""):
+                if len(line) > MAX_LINE:
                     break
                 try:
                     data = json.loads(line)
@@ -64,19 +63,18 @@ def handle(client, address):
     except (OSError, ValueError, UnicodeError):
         pass
     finally:
-        with lock:
-            if name:
-                users.pop(client, None)
         if name:
+            with lock:
+                users.pop(client, None)
             broadcast("system", text=f"{name} left the room")
             refresh()
 
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen()
-    print(f"LocalSocketChat listening on {HOST}:{PORT}", flush=True)
-    while True:
-        conn, addr = server.accept()
-        threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+if __name__ == "__main__":
+    with socket.socket() as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", PORT))
+        server.listen()
+        print(f"LocalSocketChat listening on 0.0.0.0:{PORT}", flush=True)
+        while True:
+            threading.Thread(target=handle, args=(server.accept()[0],), daemon=True).start()
